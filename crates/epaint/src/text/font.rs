@@ -38,7 +38,7 @@ pub struct GlyphInfo {
     ///
     /// Doesn't need to be unique.
     /// Use `ab_glyph::GlyphId(0)` if you just want to have an id, and don't care.
-    pub(crate) id: ab_glyph::GlyphId,
+    pub(crate) id: swash::GlyphId,
 
     /// Unit: points.
     pub advance_width: f32,
@@ -51,7 +51,7 @@ impl Default for GlyphInfo {
     /// Basically a zero-width space.
     fn default() -> Self {
         Self {
-            id: ab_glyph::GlyphId(0),
+            id: swash::GlyphId::default(),
             advance_width: 0.0,
             uv_rect: Default::default(),
         }
@@ -64,7 +64,11 @@ impl Default for GlyphInfo {
 /// The interface uses points as the unit for everything.
 pub struct FontImpl {
     name: String,
-    ab_glyph_font: ab_glyph::FontArc,
+    // ab_glyph_font: ab_glyph2::FontArc,
+    swash_font: Arc<FontData2>,
+    scale: f32,
+    units_per_em: u16,
+    // metrics: swash::Metrics,
 
     /// Maximum character height
     scale_in_pixels: u32,
@@ -85,18 +89,19 @@ impl FontImpl {
         atlas: Arc<Mutex<TextureAtlas>>,
         pixels_per_point: f32,
         name: String,
-        ab_glyph_font: ab_glyph::FontArc,
+        swash_font: Arc<FontData2>,
         scale_in_pixels: f32,
         tweak: FontTweak,
     ) -> Self {
         assert!(scale_in_pixels > 0.0);
         assert!(pixels_per_point > 0.0);
 
-        use ab_glyph::*;
-        let scaled = ab_glyph_font.as_scaled(scale_in_pixels);
-        let ascent = scaled.ascent() / pixels_per_point;
-        let descent = scaled.descent() / pixels_per_point;
-        let line_gap = scaled.line_gap() / pixels_per_point;
+        let metrics = swash_font.as_swash().metrics(&[]);
+        let scale = scale_in_pixels / (metrics.ascent + metrics.descent);
+        let scaled = metrics.linear_scale(scale);
+        let ascent = scaled.ascent / pixels_per_point;
+        let descent = -scaled.descent / pixels_per_point;
+        let line_gap = scaled.leading / pixels_per_point;
 
         // Tweak the scale as the user desired
         let scale_in_pixels = scale_in_pixels * tweak.scale;
@@ -124,7 +129,9 @@ impl FontImpl {
 
         Self {
             name,
-            ab_glyph_font,
+            swash_font,
+            scale,
+            units_per_em: metrics.units_per_em,
             scale_in_pixels,
             height_in_points: ascent - descent + line_gap,
             y_offset_in_points,
@@ -164,12 +171,18 @@ impl FontImpl {
     }
 
     /// An un-ordered iterator over all supported characters.
-    fn characters(&self) -> impl Iterator<Item = char> + '_ {
-        use ab_glyph::Font as _;
-        self.ab_glyph_font
-            .codepoint_ids()
-            .map(|(_, chr)| chr)
-            .filter(|&chr| !self.ignore_character(chr))
+    fn characters(&self) -> impl Iterator<Item=char> {
+        let mut chars = vec![];
+        self.swash_font
+            .as_swash()
+            .charmap()
+            .enumerate(|chr, _| {
+                let chr = char::from_u32(chr).unwrap();
+                if !self.ignore_character(chr) {
+                    chars.push(chr);
+                }
+            });
+        chars.into_iter()
     }
 
     /// `\n` will result in `None`
@@ -219,10 +232,9 @@ impl FontImpl {
         }
 
         // Add new character:
-        use ab_glyph::Font as _;
-        let glyph_id = self.ab_glyph_font.glyph_id(c);
+        let glyph_id = self.swash_font.as_swash().charmap().map(c);
 
-        if glyph_id.0 == 0 {
+        if glyph_id == 0 {
             None // unsupported character
         } else {
             let glyph_info = self.allocate_glyph(glyph_id);
@@ -234,14 +246,10 @@ impl FontImpl {
     #[inline]
     pub fn pair_kerning(
         &self,
-        last_glyph_id: ab_glyph::GlyphId,
-        glyph_id: ab_glyph::GlyphId,
+        _last_glyph_id: swash::GlyphId,
+        _glyph_id: swash::GlyphId,
     ) -> f32 {
-        use ab_glyph::{Font as _, ScaleFont};
-        self.ab_glyph_font
-            .as_scaled(self.scale_in_pixels as f32)
-            .kern(last_glyph_id, glyph_id)
-            / self.pixels_per_point
+        0.0
     }
 
     /// Height of one row of text in points.
@@ -263,36 +271,54 @@ impl FontImpl {
         self.ascent
     }
 
-    fn allocate_glyph(&self, glyph_id: ab_glyph::GlyphId) -> GlyphInfo {
-        assert!(glyph_id.0 != 0);
-        use ab_glyph::{Font as _, ScaleFont};
+    fn allocate_glyph(&self, glyph_id: swash::GlyphId) -> GlyphInfo {
+        assert!(glyph_id != 0);
+        use swash::{
+            scale::{Render, Source, StrikeWith},
+            zeno::{Format, Placement},
+        };
 
-        let glyph = glyph_id.with_scale_and_position(
-            self.scale_in_pixels as f32,
-            ab_glyph::Point { x: 0.0, y: 0.0 },
-        );
+        let rendered_image = SCALE_CONTEXT.with(|context| {
+            let mut context = context.borrow_mut();
+            let mut scaler = context
+                .builder(self.swash_font.as_swash())
+                .size(self.scale * self.units_per_em as f32)
+                .hint(true)
+                .build();
 
-        let uv_rect = self.ab_glyph_font.outline_glyph(glyph).map(|glyph| {
-            let bb = glyph.px_bounds();
-            let glyph_width = bb.width() as usize;
-            let glyph_height = bb.height() as usize;
+            Render::new(&[
+                Source::ColorOutline(0),
+                Source::ColorBitmap(StrikeWith::BestFit),
+                Source::Outline,
+            ])
+                .format(Format::Alpha)
+                .render(&mut scaler, glyph_id)
+        });
+
+        let uv_rect = rendered_image.map(|rendered_image| {
+            let Placement { left, top, width, height } = rendered_image.placement;
+            let glyph_width = width as usize;
+            let glyph_height = height as usize;
             if glyph_width == 0 || glyph_height == 0 {
                 UvRect::default()
             } else {
                 let glyph_pos = {
                     let atlas = &mut self.atlas.lock();
                     let (glyph_pos, image) = atlas.allocate((glyph_width, glyph_height));
-                    glyph.draw(|x, y, v| {
-                        if 0.0 < v {
-                            let px = glyph_pos.0 + x as usize;
-                            let py = glyph_pos.1 + y as usize;
-                            image[(px, py)] = v;
-                        }
-                    });
+                    (0..height as usize)
+                        .flat_map(|y| (0..width as usize).map(move |x| (x, y)))
+                        .zip(&rendered_image.data)
+                        .for_each(|((x, y), &v)| {
+                            if 0 < v {
+                                let px = glyph_pos.0 + x;
+                                let py = glyph_pos.1 + y;
+                                image[(px, py)] = v as f32 / 255.0;
+                            }
+                        });
                     glyph_pos
                 };
 
-                let offset_in_pixels = vec2(bb.min.x, bb.min.y);
+                let offset_in_pixels = vec2(left as f32, -top as f32);
                 let offset =
                     offset_in_pixels / self.pixels_per_point + self.y_offset_in_points * Vec2::Y;
                 UvRect {
@@ -308,10 +334,11 @@ impl FontImpl {
         });
         let uv_rect = uv_rect.unwrap_or_default();
 
-        let advance_width_in_points = self
-            .ab_glyph_font
-            .as_scaled(self.scale_in_pixels as f32)
-            .h_advance(glyph_id)
+        let advance_width_in_points = self.swash_font
+            .as_swash()
+            .glyph_metrics(&[])
+            .linear_scale(self.scale)
+            .advance_width(glyph_id)
             / self.pixels_per_point;
 
         GlyphInfo {
@@ -518,4 +545,24 @@ fn invisible_char(c: char) -> bool {
             | '\u{206F}' // NOMINAL DIGIT SHAPES
             | '\u{FEFF}' // ZERO WIDTH NO-BREAK SPACE
     )
+}
+
+thread_local! {
+    static SCALE_CONTEXT: std::cell::RefCell<swash::scale::ScaleContext> = Default::default();
+}
+
+pub struct FontData2 {
+    pub data: std::borrow::Cow<'static, [u8]>,
+    pub offset: u32,
+    pub key: swash::CacheKey,
+}
+
+impl FontData2 {
+    pub fn as_swash(&self) -> swash::FontRef<'_> {
+        swash::FontRef {
+            data: &self.data,
+            offset: self.offset,
+            key: self.key,
+        }
+    }
 }
